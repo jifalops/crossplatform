@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:async';
 import 'dart:convert';
 import 'package:args/args.dart';
 import 'package:colorize/colorize.dart';
@@ -53,50 +54,44 @@ void main(List<String> args) async {
   final packagesFile = File('$path/.packages');
   final pubspecFile = File('$path/pubspec.yaml');
 
-  if (packagesFile.existsSync() && pubspecFile.existsSync()) {
-    String packagesString = packagesFile.readAsStringSync();
+  // pubspec.yaml must exist.
+  if (pubspecFile.existsSync()) {
+    final pubspecLines = pubspecFile.readAsLinesSync();
+    Command command;
 
-    if (upgrade || runGet) {
-      String command;
-      final commandArgs = <String>[];
-      if (packagesString.contains(RegExp(r'\sflutter:', multiLine: true))) {
-        command = 'flutter';
-        commandArgs.add('packages');
-      } else {
-        command = 'pub';
-      }
-      commandArgs.add(upgrade ? 'upgrade' : 'get');
-      print('Running command "$command ${commandArgs.join()}"');
-      print('-----');
-      final process =
-          await Process.start(command, commandArgs, workingDirectory: path);
-      process.stdout
-          .transform(utf8.decoder)
-          .listen((data) => stdout.write(data));
-      process.stderr
-          .transform(utf8.decoder)
-          .listen((data) => stderr.write(data));
-      final exitCode = await process.exitCode;
-      print('-----');
-      if (exitCode == 0) {
-        packagesString = packagesFile.readAsStringSync();
-      } else {
-        print('Command failed, bailing on version upgrades.');
+    // Try to create .packages if it doesn't exist.
+    if (!packagesFile.existsSync()) {
+      print('`.packages` not found. Creating...');
+      command = Command.fromPubspec(pubspecLines, upgrade);
+      await command.run(path);
+      if (!packagesFile.existsSync()) {
+        print('Failed to create `.packages`. Exiting.');
         return;
       }
     }
 
-    final packages = parseVersions(packagesString);
-    final pubspec = findChanges(pubspecFile, packages);
+    // Run get/upgrade if requested and it hasn't been run.
+    if ((upgrade || runGet) && command == null) {
+      command = Command.fromPubspec(pubspecLines, upgrade);
+      int exitCode = await command.run(path);
+      if (exitCode != 0) {
+        print('Command failed, cannot update versions.');
+        return;
+      }
+    }
+
+    final packages = parsePackageVersions(packagesFile);
+    final pubspec = findChanges(pubspecLines, packages);
+
     if (pubspec.changed) {
       print('The following pubspec.yaml package versions will be changed:');
-      if (pubspec.mainDepsChanges.isNotEmpty) {
+      if (pubspec.mainChanges.isNotEmpty) {
         print('dependencies:');
-        pubspec.mainDepsChanges.forEach((dep) => print('  $dep'));
+        pubspec.mainChanges.forEach((dep) => print('  $dep'));
       }
-      if (pubspec.devDepsChanges.isNotEmpty) {
+      if (pubspec.devChanges.isNotEmpty) {
         print('dev_dependencies:');
-        pubspec.devDepsChanges.forEach((dep) => print('  $dep'));
+        pubspec.devChanges.forEach((dep) => print('  $dep'));
       }
       bool confirmed = true;
       if (prompt) {
@@ -110,24 +105,56 @@ void main(List<String> args) async {
       print('pubspec.yaml versions are already up to date!');
     }
   } else {
-    print('"$path" is not a package directory.');
+    print('"$path" is not a package directory.\n');
     print(usage(parser));
   }
 }
 
+class Command {
+  const Command(this.command, this.args);
+  final String command;
+  final List<String> args;
+
+  @override
+  toString() => '$command ${args.join(' ')}';
+
+  Future<int> run(String path) async {
+    print('Running command "$this".');
+    print('-----');
+    final process = await Process.start(command, args, workingDirectory: path);
+    process.stdout.transform(utf8.decoder).listen((data) => stdout.write(data));
+    process.stderr.transform(utf8.decoder).listen((data) => stderr.write(data));
+    final exitCode = await process.exitCode;
+    print('-----');
+    return exitCode;
+  }
+
+  static Command fromPubspec(List<String> pubspecLines, bool upgrade) {
+    String command = 'pub';
+    final args = <String>[];
+    for (final line in pubspecLines) {
+      if (line.trim() == 'flutter:') {
+        command = 'flutter';
+        args.add('packages');
+        break;
+      }
+    }
+    return Command(command, args..add(upgrade ? 'upgrade' : 'get'));
+  }
+}
+
 /// Finds *versioned* packages in a `.packages` file's contents.
-Map<String, String> parseVersions(String packagesString) {
+Map<String, String> parsePackageVersions(File packagesFile) {
   return Map.fromEntries(RegExp(r'/(\w+)-([0-9.+]+[-\w]*)/lib/')
-      .allMatches(packagesString)
+      .allMatches(packagesFile.readAsStringSync())
       .map((match) => MapEntry(match.group(1), match.group(2))));
 }
 
 /// Finds changes to the version string of *versioned* packages in a
 /// `pubspec.yaml` file.
-ChangedPubspec findChanges(File pubspecFile, Map<String, String> versions) {
+ChangedPubspec findChanges(List<String> lines, Map<String, String> versions) {
   final matcher = RegExp(r'^  (\w+):\s*(.+)');
   final prefixMatcher = RegExp(r'([<>=^|]*)\d');
-  final lines = pubspecFile.readAsLinesSync();
   final mainChanges = <String>[];
   final devChanges = <String>[];
   int index = 0;
@@ -168,10 +195,9 @@ ChangedPubspec findChanges(File pubspecFile, Map<String, String> versions) {
 }
 
 class ChangedPubspec {
-  const ChangedPubspec(
-      this.contents, this.mainDepsChanges, this.devDepsChanges);
-  final List<String> contents, mainDepsChanges, devDepsChanges;
-  bool get changed => mainDepsChanges.isNotEmpty || devDepsChanges.isNotEmpty;
+  const ChangedPubspec(this.contents, this.mainChanges, this.devChanges);
+  final List<String> contents, mainChanges, devChanges;
+  bool get changed => mainChanges.isNotEmpty || devChanges.isNotEmpty;
 }
 
 String promptUser(String prompt, [bool singleByte = false]) {
