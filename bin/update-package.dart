@@ -4,49 +4,80 @@ import 'dart:convert';
 import 'package:args/args.dart';
 import 'package:colorize/colorize.dart';
 
+/// Word characters with dots.
+/// Dots must be non-consecutive and cannot start or end a package name.
+const packageNameRegex = r'\w(?:\.?\w)*';
+
+/// 0.0.0-prerelease+build
+const packageVersionRegex =
+    '\\d+\\.\\d+\\.\\d+(?:-$_namedPart)?(?:\\+$_namedPart)?';
+
+/// Pre-relase and build number of a package version. Alphanumerics, hyphens,
+/// and dots. Dots must be non-consecutive and cannot start or end a named
+/// version part.
+const _namedPart = r'[a-zA-Z0-9-](?:\.?[a-zA-Z0-9-])*';
+
+bool silent;
+String usage;
+
 void main(List<String> args) async {
   final parser = ArgParser()
-    ..addFlag('help',
-        abbr: 'h',
+    ..addFlag('confirm',
+        abbr: 'c',
         defaultsTo: false,
         negatable: false,
-        help: 'Print this help message.')
-    ..addFlag('prompt',
-        defaultsTo: true,
-        help: 'Prompt the user to confirm before making changes.')
+        help: 'Update packages without prompting the user for confirmation.')
+    ..addFlag('force',
+        abbr: 'f',
+        defaultsTo: false,
+        negatable: false,
+        help: 'Equivalent to --upgrade --confirm.')
     ..addFlag('get',
         abbr: 'g',
         defaultsTo: false,
         negatable: false,
         help:
-            'Runs `pub get` or `flutter packages get` on the package before processing.')
+            'Run `pub get` or `flutter packages get` on the package before processing.')
+    ..addFlag('help',
+        abbr: 'h',
+        defaultsTo: false,
+        negatable: false,
+        help: 'Print this help message.')
+    ..addFlag('silent',
+        abbr: 's',
+        defaultsTo: false,
+        negatable: false,
+        help: 'Suppress all output.')
     ..addFlag('upgrade',
         abbr: 'u',
         defaultsTo: false,
         negatable: false,
         help:
-            'Runs `pub upgrade` or `flutter packages upgrade` on the package before processing.'
-            ' This option overrides --get.')
-    ..addFlag('force',
-        abbr: 'f',
-        defaultsTo: false,
-        negatable: false,
-        help: 'Equivalent to --upgrade --no-prompt');
+            'Run `pub upgrade` or `flutter packages upgrade` on the package before processing.'
+            ' This option overrides --get.');
+
+  usage = '''
+Usage: update-package.dart [arguments] [directory]
+
+arguments
+${parser.usage}
+''';
 
   ArgResults argv;
   try {
     argv = parser.parse(args);
   } catch (e) {
-    print(usage(parser));
+    print(usage);
     return;
   }
   if (argv['help'] || argv.rest.length > 1) {
-    print(usage(parser));
+    print(usage);
     return;
   }
 
+  silent = argv['silent'];
   final force = argv['force'];
-  final prompt = !force && argv['prompt'];
+  final confirm = force || argv['confirm'];
   final upgrade = force || argv['upgrade'];
   final runGet = !upgrade && argv['get'];
   final path = argv.rest.length == 1 ? argv.rest.first : '.';
@@ -61,11 +92,11 @@ void main(List<String> args) async {
 
     // Try to create .packages if it doesn't exist.
     if (!packagesFile.existsSync()) {
-      print('`.packages` not found. Creating...');
+      sprint('`.packages` not found. Creating...');
       command = Command.fromPubspec(pubspecLines, upgrade);
       await command.run(path);
       if (!packagesFile.existsSync()) {
-        print('Failed to create `.packages`. Exiting.');
+        sprint('Failed to create `.packages`. Exiting.');
         return;
       }
     }
@@ -75,26 +106,26 @@ void main(List<String> args) async {
       command = Command.fromPubspec(pubspecLines, upgrade);
       int exitCode = await command.run(path);
       if (exitCode != 0) {
-        print('Command failed, cannot update versions.');
+        sprint('Command failed, cannot update versions.');
         return;
       }
     }
 
     final packages = parsePackageVersions(packagesFile);
-    final pubspec = findChanges(pubspecLines, packages);
+    final pubspec = ChangedPubspec.fromLines(pubspecLines, packages);
 
     if (pubspec.changed) {
-      print('The following pubspec.yaml package versions will be changed:');
+      sprint('The following pubspec.yaml package versions will be changed:');
       if (pubspec.mainChanges.isNotEmpty) {
-        print('dependencies:');
-        pubspec.mainChanges.forEach((dep) => print('  $dep'));
+        sprint('dependencies:');
+        pubspec.mainChanges.forEach((dep) => sprint('  $dep'));
       }
       if (pubspec.devChanges.isNotEmpty) {
-        print('dev_dependencies:');
-        pubspec.devChanges.forEach((dep) => print('  $dep'));
+        sprint('dev_dependencies:');
+        pubspec.devChanges.forEach((dep) => sprint('  $dep'));
       }
       bool confirmed = true;
-      if (prompt) {
+      if (!confirm) {
         final reponse = promptUser('Continue with changes? [y/N]');
         confirmed = reponse.toLowerCase() == 'y';
       }
@@ -102,11 +133,11 @@ void main(List<String> args) async {
         pubspecFile.writeAsStringSync(pubspec.contents.join('\n'), flush: true);
       }
     } else {
-      print('pubspec.yaml versions are already up to date!');
+      sprint('pubspec.yaml versions are already up to date!');
     }
   } else {
-    print('"$path" is not a package directory.\n');
-    print(usage(parser));
+    print('"$path" does not contain a pubspec.yaml file.\n');
+    print(usage);
   }
 }
 
@@ -119,13 +150,17 @@ class Command {
   toString() => '$command ${args.join(' ')}';
 
   Future<int> run(String path) async {
-    print('Running command "$this".');
-    print('-----');
+    sprint('Running command "$this".');
+    sprint('-----');
     final process = await Process.start(command, args, workingDirectory: path);
-    process.stdout.transform(utf8.decoder).listen((data) => stdout.write(data));
-    process.stderr.transform(utf8.decoder).listen((data) => stderr.write(data));
+    process.stdout
+        .transform(utf8.decoder)
+        .listen((data) => silent ? null : stdout.write(data));
+    process.stderr
+        .transform(utf8.decoder)
+        .listen((data) => silent ? null : stderr.write(data));
     final exitCode = await process.exitCode;
-    print('-----');
+    sprint('-----');
     return exitCode;
   }
 
@@ -145,59 +180,65 @@ class Command {
 
 /// Finds *versioned* packages in a `.packages` file's contents.
 Map<String, String> parsePackageVersions(File packagesFile) {
-  return Map.fromEntries(RegExp(r'/(\w+)-([0-9.+]+[-\w]*)/lib/')
-      .allMatches(packagesFile.readAsStringSync())
-      .map((match) => MapEntry(match.group(1), match.group(2))));
-}
-
-/// Finds changes to the version string of *versioned* packages in a
-/// `pubspec.yaml` file.
-ChangedPubspec findChanges(List<String> lines, Map<String, String> versions) {
-  final matcher = RegExp(r'^  (\w+):\s*(.+)');
-  final prefixMatcher = RegExp(r'([<>=^|]*)\d');
-  final mainChanges = <String>[];
-  final devChanges = <String>[];
-  int index = 0;
-  while (index < lines.length) {
-    final isMainDepsHeader = lines[index].trimRight() == 'dependencies:';
-    final isDevDepsHeader = lines[index].trimRight() == 'dev_dependencies:';
-    if (isMainDepsHeader || isDevDepsHeader) {
-      int subIndex = index + 1;
-      while (subIndex < lines.length &&
-          (lines[subIndex].isEmpty || lines[subIndex].startsWith('  '))) {
-        final match = matcher.firstMatch(lines[subIndex]);
-        if (match != null) {
-          assert(versions.containsKey(match.group(1)));
-          final pkg = match.group(1);
-          final oldVersion = match.group(2);
-          final prefix = prefixMatcher.firstMatch(oldVersion)?.group(1) ?? '';
-          final newVersion = '${prefix}${versions[pkg]}';
-          if (oldVersion != newVersion) {
-            final change =
-                '$pkg: ${Colorize(oldVersion)..red()} ${Colorize(newVersion)..green()}';
-            if (isMainDepsHeader) {
-              mainChanges.add(change);
-            } else if (isDevDepsHeader) {
-              devChanges.add(change);
-            }
-            lines[subIndex] =
-                lines[subIndex].replaceFirst(oldVersion, newVersion);
-          }
-        }
-        subIndex++;
-      }
-      index = subIndex;
-    } else {
-      index++;
-    }
-  }
-  return ChangedPubspec(lines, mainChanges, devChanges);
+  return Map.fromEntries(
+      RegExp('/($packageNameRegex)-($packageVersionRegex)/lib/')
+          .allMatches(packagesFile.readAsStringSync())
+          .map((match) => MapEntry(match.group(1), match.group(2))));
 }
 
 class ChangedPubspec {
   const ChangedPubspec(this.contents, this.mainChanges, this.devChanges);
   final List<String> contents, mainChanges, devChanges;
   bool get changed => mainChanges.isNotEmpty || devChanges.isNotEmpty;
+
+  /// Finds version changes in the lines of a pubspec.yaml by comparing them to
+  /// their latest version.
+  static ChangedPubspec fromLines(
+      List<String> lines, Map<String, String> latestVersions) {
+    final depMatcher =
+        RegExp('^  ["\']?($packageNameRegex)["\']?\\s*:\\s*(.*)\\s*\$');
+    final mainChanges = <String>[];
+    final devChanges = <String>[];
+    int index = 0;
+    while (index < lines.length) {
+      final isMainDepsHeader = lines[index].trimRight() == 'dependencies:';
+      final isDevDepsHeader = lines[index].trimRight() == 'dev_dependencies:';
+      if (isMainDepsHeader || isDevDepsHeader) {
+        int subIndex = index + 1;
+        while (subIndex < lines.length &&
+            (lines[subIndex].isEmpty || lines[subIndex].startsWith('  '))) {
+          final match = depMatcher.firstMatch(lines[subIndex]);
+          if (match != null) {
+            int nextLine = subIndex + 1;
+            while (nextLine < lines.length && lines[nextLine].trim().isEmpty)
+              nextLine++;
+            if (nextLine >= lines.length ||
+                !lines[nextLine].startsWith('    ')) {
+              final pkg = match.group(1);
+              assert(latestVersions.containsKey(pkg));
+              final oldVersion = match.group(2)?.trim();
+              final newVersion = '^${latestVersions[pkg]}';
+              if (oldVersion != newVersion) {
+                final change =
+                    '$pkg: ${Colorize(oldVersion)..red()} ${Colorize(newVersion)..green()}';
+                if (isMainDepsHeader) {
+                  mainChanges.add(change);
+                } else if (isDevDepsHeader) {
+                  devChanges.add(change);
+                }
+                lines[subIndex] = '  $pkg: $newVersion';
+              }
+            }
+          }
+          subIndex++;
+        }
+        index = subIndex;
+      } else {
+        index++;
+      }
+    }
+    return ChangedPubspec(lines, mainChanges, devChanges);
+  }
 }
 
 String promptUser(String prompt, [bool singleByte = false]) {
@@ -207,8 +248,4 @@ String promptUser(String prompt, [bool singleByte = false]) {
       : stdin.readLineSync(encoding: utf8);
 }
 
-String usage(ArgParser parser) => '''
-update-package.dart [arguments] [directory]
-
-${parser.usage}
-''';
+void sprint(dynamic s) => silent ? null : print(s);
